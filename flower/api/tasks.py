@@ -636,3 +636,104 @@ Get a task info
             response['worker'] = task.worker.hostname
 
         self.write(response)
+
+
+
+class TaskReapply(BaseTaskHandler):
+    @web.authenticated
+    async def post(self, taskid):
+        """
+        Get task info and reapply the task with the same arguments.
+
+        :param taskid: ID of the task to reapply.
+        """
+        # Get original task info
+        task = tasks.get_task_by_id(self.application.events, taskid)
+        if not task:
+            raise HTTPError(404, f"Unknown task '{taskid}'")
+
+        # Get task name
+        taskname = task.name
+        if not taskname:
+            raise HTTPError(400, "Cannot reapply task with no name")
+
+        try:
+            # Get the task object from registered tasks
+            task_obj = self.capp.tasks[taskname]
+        except KeyError as exc:
+            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
+
+        # Parse args and kwargs from the original task
+        try:
+            args = self._parse_args(task.args)
+            kwargs = self._parse_kwargs(task.kwargs)
+        except Exception as exc:
+            logger.error("Error parsing task arguments: %s", exc)
+            raise HTTPError(400, f"Invalid task arguments: {str(exc)}") from exc
+
+        # Apply the task with original arguments
+        try:
+            # Ensure args and kwargs are JSON serializable
+            args = self._make_json_serializable(args)
+            kwargs = self._make_json_serializable(kwargs)
+
+            result = task_obj.apply_async(args=args, kwargs=kwargs)
+            response = {'task-id': result.task_id}
+            if self.backend_configured(result):
+                response.update(state=result.state)
+            self.write(response)
+        except Exception as exc:
+            logger.error("Error reapplying task with args=%s, kwargs=%s: %s", args, kwargs, str(exc))
+            raise HTTPError(500, f"Error reapplying task: {str(exc)}") from exc
+
+    def _parse_args(self, args):
+        """
+        Parse and process the `args` of the task.
+        """
+        if not args:
+            return []
+        try:
+            # Attempt to parse JSON
+            parsed_args = json.loads(args)
+            if isinstance(parsed_args, str) and parsed_args.startswith('(') and parsed_args.endswith(')'):
+                return eval(parsed_args)  # Handle stringified tuples
+            return parsed_args
+        except (json.JSONDecodeError, SyntaxError):
+            # Fallback for stringified tuples or ellipsis
+            if args == '...':
+                return [...]
+            if args.startswith('(') and args.endswith(')'):
+                return eval(args)
+            return [args]
+
+    def _parse_kwargs(self, kwargs):
+        """
+        Parse and process the `kwargs` of the task.
+        """
+        if not kwargs:
+            return {}
+        try:
+            # Attempt to parse JSON
+            return json.loads(kwargs)
+        except json.JSONDecodeError:
+            try:
+                # Fallback for stringified dictionaries
+                import ast
+                if kwargs.startswith('{') and kwargs.endswith('}'):
+                    return ast.literal_eval(kwargs)
+            except (ValueError, SyntaxError):
+                logger.warning("Failed to parse kwargs: %s", kwargs)
+                return {}
+        return {}
+
+    def _make_json_serializable(self, obj):
+        """
+        Recursively replace non-serializable types with JSON-serializable alternatives.
+        """
+        if isinstance(obj, list):
+            return [self._make_json_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: self._make_json_serializable(value) for key, value in obj.items()}
+        elif obj is Ellipsis:
+            return None  # Replace `...` with `null`
+        return obj  # Return the object if it's already serializable
